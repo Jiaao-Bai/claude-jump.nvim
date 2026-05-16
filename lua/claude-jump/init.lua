@@ -9,93 +9,112 @@ local parser_m  = require("claude-jump.parser")
 local _cfg        = {}
 local _active_job = nil
 
+-- ── Design philosophy ────────────────────────────────────────────────────────
+--
+-- The plugin enforces one thing only: the I/O contract with Claude.
+-- Everything semantic — what's a definition, what depth is useful, what's
+-- worth showing — is Claude's call. The contract has two pieces:
+--
+--   1. `[path:line]` is the universal "jumpable location" marker.
+--      Anywhere Claude writes one, the user can press <CR> on that line
+--      to jump there.
+--
+--   2. For jump-to-definition specifically, Claude ends with the sentinel
+--      "---JUMP-RESULT---" on its own line, immediately followed by a
+--      JSON object — the canonical answer the plugin uses for auto-jump.
+--
+-- That's it. No depth knobs, no sibling limits, no per-language heuristics.
+-- ─────────────────────────────────────────────────────────────────────────────
+
 -- ── Prompts ──────────────────────────────────────────────────────────────────
 
 local function fmt_jump_prompt(ctx)
   return ([[
-You are an expert C++ engineer helping navigate a codebase.
+You are helping a developer navigate a codebase from inside their editor.
 
 ## Task
-Find the DEFINITION (not a forward declaration) of the symbol "%s".
+Find where the symbol `%s` is DEFINED (not just declared).
 
 ## Starting point
 File : %s
 Line : %d  Column: %d
 Lang : %s
 
-## Immediate context  (lines %d–%d, cursor annotated)
+## A few lines around the cursor (cursor annotated)
 ```%s
 %s
 ```
 
-## Instructions
-1. Use your tools (read_file, grep, list_directory, etc.) to locate the definition.
-2. Only READ files — do NOT modify anything.
-3. For C++ templates / CUTLASS-style deep instantiations, check .cuh/.h/.hpp headers.
-4. When done, write EXACTLY the sentinel line followed by the JSON — nothing after:
+## How to work
+- Use your tools freely (grep, read_file, list_directory, …). Read-only.
+- Use whatever depth of exploration you think the case warrants — fast for
+  simple lookups, more thorough for templated/overloaded/macro-heavy code.
+- Whenever you reference a code location in your output, write it as
+  `[path:line]` (literal square brackets). Those become jumpable links in
+  the user's window — so the user gets value from your reasoning too.
+
+## Output contract
+End with EXACTLY one sentinel line, then one JSON object, then nothing:
 
 %s
 {"file": "<path>", "line": <number>, "confidence": "<high|medium|low>", "explanation": "<one sentence>"}
 
-If the definition cannot be found:
+If you genuinely cannot find it:
+
 %s
-{"file": null, "line": null, "confidence": "low", "explanation": "<reason>"}
+{"file": null, "line": null, "confidence": "low", "explanation": "<why>"}
 ]]):format(
     ctx.symbol,
     ctx.filepath, ctx.row, ctx.col, ctx.filetype,
-    ctx.context_start, ctx.context_end,
     ctx.filetype, ctx.context,
     parser_m.SENTINEL, parser_m.SENTINEL
   )
 end
 
-local function fmt_callstack_prompt(ctx, cs_cfg)
-  local cd = cs_cfg.caller_depth  or 3
-  local dd = cs_cfg.callee_depth  or 3
-  local ms = cs_cfg.max_siblings  or 5
-
+local function fmt_callstack_prompt(ctx)
   return ([[
-You are an expert C++ engineer helping understand code flow.
+You are helping a developer understand code flow from inside their editor.
 
 ## Task
-Analyze the call hierarchy for the symbol "%s".
+Build the most informative call hierarchy for the symbol `%s`.
 
 ## Starting point
 File : %s
 Line : %d
 Lang : %s
 
-## Immediate context  (lines %d–%d, cursor annotated)
+## A few lines around the cursor (cursor annotated)
 ```%s
 %s
 ```
 
-## Instructions
-1. Use your tools (read_file, grep, list_directory, etc.) to trace the call graph.
-2. Only READ files — do NOT modify anything.
-3. **Strict depth limits** — do not exceed these:
-   - Callers (upstream):  max %d levels above "%s"
-   - Callees (downstream): max %d levels below "%s"
-   - If more than %d siblings exist at any level, show the %d most relevant
-     and add a line "... N more (omitted)"
-4. Format as a single ASCII tree with [file:line] for confirmed nodes, [?] for uncertain ones.
+## How to work
+- Use your tools freely (grep, read_file, list_directory, …). Read-only.
+- Use your judgment for depth and breadth. The output renders in a small
+  floating window (~30 lines visible), so prefer signal over completeness:
+  show the slice that best helps the user understand how `%s` fits into the
+  codebase. When a fan-out gets noisy, truncate and say "... N more".
+- Annotate every confirmed location as `[path:line]` — those become
+  jumpable links in the user's window. Mark uncertain nodes with `[?]`.
 
-Example (depth-3 / siblings-5):
-  top_caller()  [a.h:10]
-  └── mid_caller()  [b.h:44]
+## Output format
+Render a single ASCII tree. Callers above, callees below the current symbol.
+No sentinel, no JSON — the tree itself is the deliverable. Example shape:
+
+  caller_top()  [a.h:10]
+  └── caller_mid()  [b.h:44]
       └── %s()  [current]
               ├── helper_A()  [c.h:8]
               └── helper_B()  [c.h:20]
-                      └── leaf()  [d.h:3]
 ]]):format(
     ctx.symbol,
     ctx.filepath, ctx.row, ctx.filetype,
-    ctx.context_start, ctx.context_end,
     ctx.filetype, ctx.context,
-    cd, ctx.symbol, dd, ctx.symbol, ms, ms,
-    ctx.symbol
+    ctx.symbol, ctx.symbol
   )
 end
+
+-- ── Helpers ───────────────────────────────────────────────────────────────────
 
 local function short_path(p)
   return vim.fn.fnamemodify(p, ":~:.")
@@ -110,7 +129,7 @@ end
 
 local function do_jump(result, source_win, source_filepath)
   if not result or not result.file then
-    vim.notify("claude-jump: no definition location found", vim.log.levels.WARN)
+    vim.notify("claude-jump: no location to jump to", vim.log.levels.WARN)
     return
   end
 
@@ -130,7 +149,23 @@ local function do_jump(result, source_win, source_filepath)
   vim.cmd("normal! zz")
 end
 
--- ── Core runner (shared by jump + call_stack) ────────────────────────────────
+--- Bind <CR> in the floating window to jump to the `[path:line]` marker on
+--- the current line, if any. This is the universal navigation primitive.
+local function bind_inline_jump(state, source_win, source_filepath)
+  ui_m.bind(state, "<CR>", function()
+    local row = vim.api.nvim_win_get_cursor(state.win)[1]
+    local line = (vim.api.nvim_buf_get_lines(state.buf, row - 1, row, false))[1] or ""
+    local loc = parser_m.location_on_line(line)
+    if loc then
+      ui_m.close(state)
+      do_jump(loc, source_win, source_filepath)
+    else
+      vim.notify("claude-jump: no [path:line] marker on this line", vim.log.levels.INFO)
+    end
+  end)
+end
+
+-- ── Core runner ──────────────────────────────────────────────────────────────
 
 local function run_with_ui(prompt, header_lines, on_done_extra)
   local source_win      = vim.api.nvim_get_current_win()
@@ -139,17 +174,18 @@ local function run_with_ui(prompt, header_lines, on_done_extra)
   local state = ui_m.open(_cfg)
   ui_m.set_lines(state, header_lines)
 
+  -- Universal navigation: any line containing [path:line] is jumpable.
+  bind_inline_jump(state, source_win, source_filepath)
+
   cancel_active()
 
   _active_job = claude_m.run(
     prompt, _cfg,
 
-    -- on_line: stream each output line into the window
     function(line)
       ui_m.append(state, line)
     end,
 
-    -- on_done: called once Claude exits
     function(exit_code, full_output, err_output)
       _active_job = nil
 
@@ -182,7 +218,7 @@ function M.jump()
 
   local header = {
     ("  Symbol : %s"):format(ctx.symbol),
-    ("  File   : %s  line %d"):format(short_path(ctx.filepath), ctx.row),
+    ("  From   : %s  line %d"):format(short_path(ctx.filepath), ctx.row),
     ("  Status : asking Claude…"),
     "",
   }
@@ -193,19 +229,16 @@ function M.jump()
     if result and result.file then
       ui_m.append_block(state, {
         "",
-        ("  → %s : %d"):format(result.file, result.line or 0),
-        ("    confidence : %s"):format(result.confidence or "?"),
+        ("  → [%s:%d]   confidence: %s"):format(result.file, result.line or 0, result.confidence or "?"),
         result.explanation ~= "" and ("    " .. result.explanation) or "",
         "",
-        "  [Enter] Jump    [q/Esc] Cancel",
+        "  [Enter] on any [path:line] → jump      [q/Esc] close",
       })
 
-      ui_m.bind(state, "<CR>", function()
-        ui_m.close(state)
-        do_jump(result, source_win, source_filepath)
-      end)
+      -- Move cursor to the result line so <Enter> Just Works.
+      local total = vim.api.nvim_buf_line_count(state.buf)
+      pcall(vim.api.nvim_win_set_cursor, state.win, { total - 2, 0 })
 
-      -- Auto-jump when confidence is high and user opted in
       if _cfg.auto_jump and result.confidence == "high" then
         vim.defer_fn(function()
           if vim.api.nvim_win_is_valid(state.win) then
@@ -217,14 +250,15 @@ function M.jump()
     else
       ui_m.append_block(state, {
         "",
-        "  Could not determine definition location.",
+        "  Could not determine a single definition location.",
+        "  Any [path:line] above is still jumpable via [Enter].",
         "  [q/Esc] Close",
       })
     end
   end)
 end
 
---- Show the call-stack / call-hierarchy for the symbol under the cursor.
+--- Show the call hierarchy for the symbol under the cursor.
 function M.call_stack()
   local ctx = context_m.get({ context_lines = _cfg.context_lines })
   if ctx.symbol == "" then
@@ -234,17 +268,20 @@ function M.call_stack()
 
   local header = {
     ("  Call Stack : %s"):format(ctx.symbol),
-    ("  File       : %s  line %d"):format(short_path(ctx.filepath), ctx.row),
+    ("  From       : %s  line %d"):format(short_path(ctx.filepath), ctx.row),
     ("  Status     : analyzing with Claude…"),
     "",
   }
 
-  run_with_ui(fmt_callstack_prompt(ctx, _cfg.call_stack or {}), header, function(state, _, _, _)
-    ui_m.append_block(state, { "", "  [q/Esc] Close" })
+  run_with_ui(fmt_callstack_prompt(ctx), header, function(state, _, _, _)
+    ui_m.append_block(state, {
+      "",
+      "  [Enter] on any [path:line] → jump      [q/Esc] close",
+    })
   end)
 end
 
---- Plugin setup — call this from your config with optional overrides.
+--- Plugin setup — call from your config with optional overrides.
 function M.setup(opts)
   _cfg = config_m.setup(opts)
 

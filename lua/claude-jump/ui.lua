@@ -28,8 +28,14 @@ function M.open(config)
   })
 
   vim.wo[win].wrap       = true
-  vim.wo[win].cursorline = false
+  vim.wo[win].cursorline = true
   vim.wo[win].number     = false
+
+  -- Highlight [path:line] markers so jumpable lines stand out.
+  api.nvim_buf_call(buf, function()
+    vim.cmd([[syntax match ClaudeJumpLoc /\[[^][:]\+:\d\+\]/]])
+    vim.cmd([[highlight default link ClaudeJumpLoc Special]])
+  end)
 
   -- q / Esc closes the window
   local function close()

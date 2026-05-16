@@ -70,6 +70,20 @@ function M.definition(response)
   return pattern_extract(response)
 end
 
+--- Extract the first `[path:line]` marker on a single buffer line.
+--- Returns { file, line } or nil. This is the universal jump primitive used
+--- in the floating window — anywhere Claude writes [path:line], the user
+--- can press <CR> to navigate there.
+function M.location_on_line(line_text)
+  if not line_text then return nil end
+  -- [<any chars except ']' and ':'>:<digits>]
+  local file, lnum = line_text:match("%[([^%]:]+):(%d+)%]")
+  if file and lnum then
+    return { file = file, line = tonumber(lnum) }
+  end
+  return nil
+end
+
 --- Expose the sentinel so the prompt builder can embed it.
 M.SENTINEL = SENTINEL
 

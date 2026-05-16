@@ -3,122 +3,117 @@
 AI-powered go-to-definition for Neovim, powered by Claude Code.  
 For when ctags and clangd give up — think CUTLASS-level C++ template metaprogramming.
 
-## Why
+## Design philosophy
+
+> **The plugin enforces the I/O contract. Claude does everything else.**
+
+Concretely:
+
+- No depth knobs, no sibling limits, no per-language heuristics. Claude has
+  tools — let it decide what's worth showing.
+- The plugin only locks down two things in the prompt:
+  1. `[path:line]` is the universal "jumpable location" marker. Anywhere Claude
+     writes one, `<CR>` on that line in the floating window jumps there.
+  2. For `:ClaudeJump`, Claude ends with a sentinel `---JUMP-RESULT---` followed
+     by a single JSON object so the plugin can auto-jump on high confidence.
+
+Everything else — search depth, which files to read, how wide to fan out a
+call tree, what's signal vs. noise — is Claude's call.
+
+## Why this plugin
 
 `clangd` and `ctags` choke on heavily templated C++ (partial specialisations,
-SFINAE chains, CUTLASS tile iterators, …).  This plugin sends the symbol under
-your cursor plus its surrounding context to Claude Code, which uses its tools
-(`grep_ast`, `read_file`, …) to actually *find* the definition across headers,
-and then jumps you there.
+SFINAE chains, CUTLASS tile iterators, …). This plugin pipes the symbol under
+your cursor to Claude Code, which uses `grep`, `read_file`, etc. to find the
+definition across headers and tells the editor where to jump.
+
+Use it as a *fallback* when your normal LSP gives up — not as a daily driver.
 
 ## Requirements
 
 - Neovim 0.9+
 - [Claude Code CLI](https://docs.anthropic.com/claude-code) installed and on `$PATH`
 
-No API key wrangling needed — Claude Code handles auth.
+No API key wrangling — Claude Code handles auth.
 
 ## Installation
 
-### lazy.nvim
-
 ```lua
+-- lazy.nvim
 {
   "jiaao-bai/claude-jump.nvim",
-  config = function()
-    require("claude-jump").setup()
-  end,
-}
-```
-
-### packer.nvim
-
-```lua
-use {
-  "jiaao-bai/claude-jump.nvim",
-  config = function()
-    require("claude-jump").setup()
-  end,
+  config = function() require("claude-jump").setup() end,
 }
 ```
 
 ## Usage
 
-| Key  | Command            | Action                                       |
-|------|--------------------|----------------------------------------------|
-| `gc` | `:ClaudeJump`      | Jump to definition of symbol under cursor    |
-| `gC` | `:ClaudeCallStack` | Show call hierarchy (callers + callees) tree |
+| Key  | Command            | What it does                                                     |
+|------|--------------------|------------------------------------------------------------------|
+| `gc` | `:ClaudeJump`      | Find & jump to the definition of the symbol under the cursor     |
+| `gC` | `:ClaudeCallStack` | Render the call hierarchy (callers + callees) as a jumpable tree |
 
-Both commands open a floating window that streams Claude's reasoning live.  
-Press `<Enter>` to jump, `q` / `<Esc>` to cancel.
+Inside either floating window:
+
+- **`<CR>`** — jump to the `[path:line]` on the current line (works on
+  *any* line that contains a marker — the result line, reasoning lines,
+  call-tree nodes, anything)
+- **`q` / `<Esc>`** — close
+
+For `:ClaudeJump` the cursor is parked on the result line by default, so
+`<CR>` Just Works. For `:ClaudeCallStack` move the cursor to whichever node
+in the tree you want to visit, then `<CR>`.
 
 ## Configuration
 
 ```lua
 require("claude-jump").setup({
-  -- Claude CLI binary (must be on PATH)
-  claude_cmd = "claude",
-
-  -- Flags forwarded to the CLI
-  claude_flags = { "--print" },
-
-  -- Lines of code sent on each side of the cursor (larger = more context = slower)
-  context_lines = 60,
-
-  -- Keymaps (set to false to disable a binding)
-  keymaps = {
-    jump       = "gc",
-    call_stack = "gC",
-  },
-
-  -- Floating window size (fraction of screen)
-  ui = {
-    width  = 0.58,
-    height = 0.68,
-    border = "rounded",  -- see :h nvim_open_win for other styles
-  },
-
-  -- Auto-jump when Claude says confidence == "high" (skips the Enter prompt)
-  auto_jump = false,
+  claude_cmd    = "claude",            -- CLI binary
+  claude_flags  = { "--print" },       -- non-interactive mode
+  context_lines = 5,                   -- lines of immediate cursor context
+  keymaps       = { jump = "gc", call_stack = "gC" },  -- set to false to disable
+  ui            = { width = 0.58, height = 0.68, border = "rounded" },
+  auto_jump     = false,               -- auto-jump when confidence == "high"
 })
 ```
+
+That's all the knobs. By design.
 
 ## How it works
 
 ```
 gc pressed
   │
-  ├─ Capture: symbol, filepath, line, ±60 lines of context
+  ├─ Capture cursor: symbol, filepath, line, ±5 lines for orientation
   │
-  ├─ Build prompt → pipe to  claude --print  via stdin (async, non-blocking)
+  ├─ Build prompt → pipe to  claude --print  via stdin  (async, non-blocking)
   │
-  ├─ Floating window streams Claude's live output
-  │   (tool calls, file reads, reasoning all visible)
+  ├─ Float streams Claude's live output: tool calls, file reads, reasoning,
+  │  all annotated with [path:line] markers
   │
-  ├─ On exit: parse last JSON block  {"file":…,"line":…,"confidence":…}
+  ├─ Claude finishes with the sentinel + JSON answer
   │
-  └─ <Enter> → edit <file>  +  jump to line  +  zz
+  └─ <Enter> on any [path:line] line in the float → edit + jump + zz
 ```
 
-Claude Code runs with its full tool suite, so it can:
-- `grep_ast` the project for template specialisations
-- `read_file` headers it finds via `#include` traces
-- Reason about SFINAE / concept constraints
+Claude runs with its full tool suite, so it can `grep` the project, `read_file`
+headers, traverse `#include` chains, reason about SFINAE / concept constraints
+— whatever the case warrants.
 
-## Call-stack view (`gC`)
+## Call-stack view example
 
 ```
-  caller_A()  [gemm.h:120]
-  └── caller_B()  [mma.h:44]
+  top_caller()  [a.h:10]
+  └── mid_caller()  [b.h:44]
       └── MmaAtomShape()  [current]
               ├── Layout::stride()   [layout.h:88]
               └── TensorRef::data()  [tensor_ref.h:102]
 ```
 
-Nodes Claude cannot confirm are marked `[?]`.
+Every `[file:line]` is jumpable. Uncertain nodes are marked `[?]`.
 
 ## Tips
 
-- Open Neovim from the project root so Claude can resolve relative paths.
-- For very large projects increase `context_lines` to 100 for more signal.
+- Open Neovim from the project root so Claude resolves relative paths cleanly.
 - Set `auto_jump = true` if you trust Claude's high-confidence hits.
+- This is a *fallback* tool. For everyday navigation, your LSP is faster.
