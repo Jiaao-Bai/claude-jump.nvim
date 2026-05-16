@@ -11,8 +11,9 @@ M.defaults = {
   context_lines = 5,
   -- Default keymaps (set to false to disable)
   keymaps = {
-    jump = "gc",
+    jump       = "gc",
     call_stack = "gC",
+    focus      = nil,   -- e.g. "g." — re-open Claude window after jumping away
   },
   -- Floating window appearance
   ui = {

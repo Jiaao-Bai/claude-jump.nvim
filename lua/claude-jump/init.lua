@@ -7,23 +7,16 @@ local ui_m      = require("claude-jump.ui")
 local parser_m  = require("claude-jump.parser")
 
 local _cfg        = {}
-local _active_job = nil
+local _active_job = nil   -- non-nil while Claude is running
 
 -- ── Design philosophy ────────────────────────────────────────────────────────
 --
--- The plugin enforces one thing only: the I/O contract with Claude.
--- Everything semantic — what's a definition, what depth is useful, what's
--- worth showing — is Claude's call. The contract has two pieces:
---
---   1. `[path:line]` is the universal "jumpable location" marker.
---      Anywhere Claude writes one, the user can press <CR> on that line
---      to jump there.
---
---   2. For jump-to-definition specifically, Claude ends with the sentinel
---      "---JUMP-RESULT---" on its own line, immediately followed by a
---      JSON object — the canonical answer the plugin uses for auto-jump.
---
--- That's it. No depth knobs, no sibling limits, no per-language heuristics.
+-- The plugin enforces the I/O contract only; Claude judges everything semantic.
+-- Three invariants:
+--   1. [path:line]  is the universal jumpable-location marker.
+--   2. ClaudeJump ends with sentinel + JSON for the canonical answer.
+--   3. One Claude job at a time — new requests while Claude is running are
+--      silently ignored (never cancel-and-restart).
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- ── Prompts ──────────────────────────────────────────────────────────────────
@@ -47,11 +40,9 @@ Lang : %s
 
 ## How to work
 - Use your tools freely (grep, read_file, list_directory, …). Read-only.
-- Use whatever depth of exploration you think the case warrants — fast for
-  simple lookups, more thorough for templated/overloaded/macro-heavy code.
+- Use whatever depth of exploration the case warrants.
 - Whenever you reference a code location in your output, write it as
-  `[path:line]` (literal square brackets). Those become jumpable links in
-  the user's window — so the user gets value from your reasoning too.
+  `[path:line]` — those become jumpable links in the user's window.
 
 ## Output contract
 End with EXACTLY one sentinel line, then one JSON object, then nothing:
@@ -94,12 +85,12 @@ Lang : %s
   floating window (~30 lines visible), so prefer signal over completeness:
   show the slice that best helps the user understand how `%s` fits into the
   codebase. When a fan-out gets noisy, truncate and say "... N more".
-- Annotate every confirmed location as `[path:line]` — those become
-  jumpable links in the user's window. Mark uncertain nodes with `[?]`.
+- Annotate every confirmed location as `[path:line]` — jumpable links.
+  Mark uncertain nodes with `[?]`.
 
 ## Output format
-Render a single ASCII tree. Callers above, callees below the current symbol.
-No sentinel, no JSON — the tree itself is the deliverable. Example shape:
+A single ASCII tree. Callers above, callees below the current symbol.
+No sentinel, no JSON — the tree itself is the deliverable.
 
   caller_top()  [a.h:10]
   └── caller_mid()  [b.h:44]
@@ -120,13 +111,6 @@ local function short_path(p)
   return vim.fn.fnamemodify(p, ":~:.")
 end
 
-local function cancel_active()
-  if _active_job then
-    claude_m.stop(_active_job)
-    _active_job = nil
-  end
-end
-
 local function do_jump(result, source_win, source_filepath)
   if not result or not result.file then
     vim.notify("claude-jump: no location to jump to", vim.log.levels.WARN)
@@ -139,6 +123,8 @@ local function do_jump(result, source_win, source_filepath)
     return
   end
 
+  -- Jump into the source window (the one that was active when Claude was triggered).
+  -- If it's gone, Neovim's focus lands wherever it naturally falls after float close.
   if source_win and vim.api.nvim_win_is_valid(source_win) then
     vim.api.nvim_set_current_win(source_win)
   end
@@ -149,35 +135,41 @@ local function do_jump(result, source_win, source_filepath)
   vim.cmd("normal! zz")
 end
 
---- Bind <CR> in the floating window to jump to the `[path:line]` marker on
---- the current line, if any. This is the universal navigation primitive.
-local function bind_inline_jump(state, source_win, source_filepath)
+--- Universal jump binding: <CR> on any line containing [path:line] jumps there.
+--- Also binds <BS> as "jump back" — reopens the Claude buffer without a new run.
+local function bind_window_keys(state, source_win, source_filepath)
   ui_m.bind(state, "<CR>", function()
-    local row = vim.api.nvim_win_get_cursor(state.win)[1]
-    local line = (vim.api.nvim_buf_get_lines(state.buf, row - 1, row, false))[1] or ""
-    local loc = parser_m.location_on_line(line)
+    local row  = vim.api.nvim_win_get_cursor(state.win)[1]
+    local text = (vim.api.nvim_buf_get_lines(state.buf, row - 1, row, false))[1] or ""
+    local loc  = parser_m.location_on_line(text)
     if loc then
       ui_m.close(state)
       do_jump(loc, source_win, source_filepath)
     else
-      vim.notify("claude-jump: no [path:line] marker on this line", vim.log.levels.INFO)
+      vim.notify("claude-jump: no [path:line] on this line", vim.log.levels.INFO)
     end
   end)
 end
 
 -- ── Core runner ──────────────────────────────────────────────────────────────
 
+--- Check whether Claude is busy. Returns true and notifies if so.
+local function busy()
+  if _active_job then
+    vim.notify("claude-jump: Claude is busy — please wait", vim.log.levels.INFO)
+    return true
+  end
+  return false
+end
+
 local function run_with_ui(prompt, header_lines, on_done_extra)
+  -- Capture source context before opening any window.
   local source_win      = vim.api.nvim_get_current_win()
   local source_filepath = vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf())
 
   local state = ui_m.open(_cfg)
   ui_m.set_lines(state, header_lines)
-
-  -- Universal navigation: any line containing [path:line] is jumpable.
-  bind_inline_jump(state, source_win, source_filepath)
-
-  cancel_active()
+  bind_window_keys(state, source_win, source_filepath)
 
   _active_job = claude_m.run(
     prompt, _cfg,
@@ -196,7 +188,7 @@ local function run_with_ui(prompt, header_lines, on_done_extra)
           "  [ERROR] Claude exited with code " .. exit_code,
           err_output ~= "" and ("  " .. err_output) or "",
           "",
-          "  [q/Esc] Close",
+          "  [q/Esc] close",
         })
         return
       end
@@ -210,6 +202,8 @@ end
 
 --- Jump to the definition of the symbol under the cursor.
 function M.jump()
+  if busy() then return end
+
   local ctx = context_m.get({ context_lines = _cfg.context_lines })
   if ctx.symbol == "" then
     vim.notify("claude-jump: no symbol under cursor", vim.log.levels.WARN)
@@ -232,10 +226,10 @@ function M.jump()
         ("  → [%s:%d]   confidence: %s"):format(result.file, result.line or 0, result.confidence or "?"),
         result.explanation ~= "" and ("    " .. result.explanation) or "",
         "",
-        "  [Enter] on any [path:line] → jump      [q/Esc] close",
+        "  <CR> on any [path:line] → jump    [q/Esc] hide (output kept)",
       })
 
-      -- Move cursor to the result line so <Enter> Just Works.
+      -- Park cursor on the result line so <CR> Just Works immediately.
       local total = vim.api.nvim_buf_line_count(state.buf)
       pcall(vim.api.nvim_win_set_cursor, state.win, { total - 2, 0 })
 
@@ -251,8 +245,8 @@ function M.jump()
       ui_m.append_block(state, {
         "",
         "  Could not determine a single definition location.",
-        "  Any [path:line] above is still jumpable via [Enter].",
-        "  [q/Esc] Close",
+        "  Any [path:line] above is still jumpable via <CR>.",
+        "  [q/Esc] hide (output kept)",
       })
     end
   end)
@@ -260,6 +254,8 @@ end
 
 --- Show the call hierarchy for the symbol under the cursor.
 function M.call_stack()
+  if busy() then return end
+
   local ctx = context_m.get({ context_lines = _cfg.context_lines })
   if ctx.symbol == "" then
     vim.notify("claude-jump: no symbol under cursor", vim.log.levels.WARN)
@@ -276,9 +272,17 @@ function M.call_stack()
   run_with_ui(fmt_callstack_prompt(ctx), header, function(state, _, _, _)
     ui_m.append_block(state, {
       "",
-      "  [Enter] on any [path:line] → jump      [q/Esc] close",
+      "  <CR> on any [path:line] → jump    [q/Esc] hide (output kept)",
     })
   end)
+end
+
+--- Re-open the Claude buffer to review the previous run's output.
+--- Useful after jumping to a definition and wanting to come back.
+function M.focus()
+  if not ui_m.focus(_cfg) then
+    vim.notify("claude-jump: no previous output to show", vim.log.levels.INFO)
+  end
 end
 
 --- Plugin setup — call from your config with optional overrides.
@@ -291,6 +295,9 @@ function M.setup(opts)
   end
   if km.call_stack then
     vim.keymap.set("n", km.call_stack, M.call_stack, { desc = "Claude Jump: show call stack" })
+  end
+  if km.focus then
+    vim.keymap.set("n", km.focus, M.focus, { desc = "Claude Jump: re-open output window" })
   end
 end
 
