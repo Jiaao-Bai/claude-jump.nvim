@@ -5,8 +5,9 @@ M.defaults = {
   claude_cmd = "claude",
   -- Extra flags passed after the command (before the prompt)
   claude_flags = { "--print" },
-  -- Lines of code to send on each side of the cursor
-  context_lines = 60,
+  -- Lines sent on each side of the cursor — just enough for Claude to
+  -- recognise the symbol type; Claude uses its own tools for the real search.
+  context_lines = 5,
   -- Default keymaps (set to false to disable)
   keymaps = {
     jump = "gc",
@@ -20,6 +21,12 @@ M.defaults = {
   },
   -- Auto-jump without pressing Enter when confidence == "high"
   auto_jump = false,
+  -- Call-stack depth limits
+  call_stack = {
+    caller_depth = 3,   -- how many levels of callers to show above the symbol
+    callee_depth = 3,   -- how many levels of callees to show below the symbol
+    max_siblings = 5,   -- max nodes shown per level before truncating
+  },
 }
 
 function M.setup(opts)

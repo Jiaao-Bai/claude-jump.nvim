@@ -1,38 +1,57 @@
 -- Parse Claude's response to extract structured navigation data.
 local M = {}
 
---- Find the last JSON object in `text` that has a "file" key.
---- Returns decoded table or nil.
-local function last_json_with_file(text)
-  local result = nil
+local SENTINEL = "---JUMP-RESULT---"
+local VALID_CONFIDENCE = { high = true, medium = true, low = true }
 
-  -- Collect all {...} spans (not nested-aware but handles typical responses)
-  for block in text:gmatch("%b{}") do
-    local ok, decoded = pcall(vim.fn.json_decode, block)
-    if ok and type(decoded) == "table" and (decoded.file ~= nil or decoded.path ~= nil) then
-      result = decoded
-    end
-  end
+--- Strict validation of a decoded JSON table.
+--- Returns a clean result table or nil.
+local function validate(data)
+  if type(data) ~= "table" then return nil end
 
-  -- Also try fenced ```json ... ``` blocks
-  for block in text:gmatch("```[jJ][sS][oO][nN]%s*(.-)%s*```") do
-    local ok, decoded = pcall(vim.fn.json_decode, block)
-    if ok and type(decoded) == "table" and (decoded.file ~= nil or decoded.path ~= nil) then
-      result = decoded
-    end
-  end
+  local file = data.file
+  if file == vim.NIL then file = nil end
+  if file ~= nil and type(file) ~= "string" then return nil end
+  if file == "null" or file == "" then file = nil end
 
-  return result
+  local line = data.line
+  if line == vim.NIL then line = nil end
+  line = tonumber(line)
+  if line and (line < 1 or line ~= math.floor(line)) then line = nil end
+
+  -- A null file means Claude couldn't find it — that's valid, just return nil
+  if not file then return nil end
+
+  local confidence = data.confidence
+  if not VALID_CONFIDENCE[confidence] then confidence = "low" end
+
+  return {
+    file        = file,
+    line        = line or 1,
+    confidence  = confidence,
+    explanation = type(data.explanation) == "string" and data.explanation or "",
+  }
 end
 
---- Fallback: scan for file:line patterns in free-form text.
+--- Extract JSON that follows the sentinel marker.
+local function from_sentinel(text)
+  -- Match everything after "---JUMP-RESULT---\n"
+  local after = text:match(SENTINEL .. "\n(.*)")
+  if not after then return nil end
+
+  -- Strip optional ```json fence
+  local inner = after:match("^```[jJ][sS][oO][nN]?%s*\n?(.-)\n?```") or after
+  local ok, decoded = pcall(vim.fn.json_decode, vim.trim(inner))
+  if ok then return validate(decoded) end
+  return nil
+end
+
+--- Last-resort: scan for file:line patterns in free-form text.
 local function pattern_extract(text)
-  -- /abs/path/file.ext:123  or  relative/file.ext:123
   local file, line = text:match("([%.%/]?[%w%./%-_]+%.%a+):(%d+)")
   if file and line then
     return { file = file, line = tonumber(line), confidence = "low", explanation = "pattern match fallback" }
   end
-  -- "file.ext, line 123" or "file.ext line 123"
   file, line = text:match("([%.%/]?[%w%./%-_]+%.%a+)[,]?%s+line%s+(%d+)")
   if file and line then
     return { file = file, line = tonumber(line), confidence = "low", explanation = "pattern match fallback" }
@@ -43,21 +62,16 @@ end
 --- Parse a jump-to-definition response.
 --- Returns { file, line, confidence, explanation } or nil.
 function M.definition(response)
-  local data = last_json_with_file(response)
-  if data then
-    local file = data.file or data.path
-    if file == vim.NIL or file == "null" then file = nil end
-    local line = tonumber(data.line or data.line_number)
-    if not file then return nil end
-    return {
-      file        = file,
-      line        = line or 1,
-      confidence  = data.confidence or "medium",
-      explanation = data.explanation or data.reason or "",
-    }
-  end
+  -- Primary: sentinel-delimited JSON (what the prompt asks for)
+  local r = from_sentinel(response)
+  if r then return r end
+
+  -- Fallback: last-resort pattern match (e.g., if Claude ignored the sentinel)
   return pattern_extract(response)
 end
+
+--- Expose the sentinel so the prompt builder can embed it.
+M.SENTINEL = SENTINEL
 
 --- Resolve a path that might be relative.
 --- Returns the best readable filepath, or nil.

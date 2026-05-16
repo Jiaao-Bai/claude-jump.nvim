@@ -11,91 +11,89 @@ local _active_job = nil
 
 -- ── Prompts ──────────────────────────────────────────────────────────────────
 
-local JUMP_PROMPT = [[
+local function fmt_jump_prompt(ctx)
+  return ([[
 You are an expert C++ engineer helping navigate a codebase.
 
 ## Task
 Find the DEFINITION (not a forward declaration) of the symbol "%s".
 
-## Where we are
+## Starting point
 File : %s
 Line : %d  Column: %d
 Lang : %s
 
-## Code context  (lines %d–%d; cursor annotated)
+## Immediate context  (lines %d–%d, cursor annotated)
 ```%s
 %s
 ```
 
 ## Instructions
-1. Use your tools (read_file, grep_ast, list_directory, etc.) to locate the definition in the project.
+1. Use your tools (read_file, grep, list_directory, etc.) to locate the definition.
 2. Only READ files — do NOT modify anything.
-3. For C++ templates / CUTLASS-style deep instantiations, check .cuh / .h / .hpp headers.
-4. When confident, output EXACTLY this JSON (last thing you write, nothing after):
+3. For C++ templates / CUTLASS-style deep instantiations, check .cuh/.h/.hpp headers.
+4. When done, write EXACTLY the sentinel line followed by the JSON — nothing after:
 
-```json
+%s
 {"file": "<path>", "line": <number>, "confidence": "<high|medium|low>", "explanation": "<one sentence>"}
-```
 
-If you truly cannot determine the location:
-```json
+If the definition cannot be found:
+%s
 {"file": null, "line": null, "confidence": "low", "explanation": "<reason>"}
-```
-]]
+]]):format(
+    ctx.symbol,
+    ctx.filepath, ctx.row, ctx.col, ctx.filetype,
+    ctx.context_start, ctx.context_end,
+    ctx.filetype, ctx.context,
+    parser_m.SENTINEL, parser_m.SENTINEL
+  )
+end
 
-local CALLSTACK_PROMPT = [[
+local function fmt_callstack_prompt(ctx, cs_cfg)
+  local cd = cs_cfg.caller_depth  or 3
+  local dd = cs_cfg.callee_depth  or 3
+  local ms = cs_cfg.max_siblings  or 5
+
+  return ([[
 You are an expert C++ engineer helping understand code flow.
 
 ## Task
 Analyze the call hierarchy for the symbol "%s".
 
-## Where we are
+## Starting point
 File : %s
 Line : %d
 Lang : %s
 
-## Code context  (lines %d–%d; cursor annotated)
+## Immediate context  (lines %d–%d, cursor annotated)
 ```%s
 %s
 ```
 
 ## Instructions
-1. Use your tools (read_file, grep_ast, list_directory, etc.) to trace the call graph.
+1. Use your tools (read_file, grep, list_directory, etc.) to trace the call graph.
 2. Only READ files — do NOT modify anything.
-3. Show:
-   • CALLERS  — what calls "%s" (upstream callers, as deep as useful)
-   • CALLEES  — what "%s" itself calls (downstream, as deep as useful)
-4. Format as an ASCII tree.  Include [file:line] for every node you can confirm.
+3. **Strict depth limits** — do not exceed these:
+   - Callers (upstream):  max %d levels above "%s"
+   - Callees (downstream): max %d levels below "%s"
+   - If more than %d siblings exist at any level, show the %d most relevant
+     and add a line "... N more (omitted)"
+4. Format as a single ASCII tree with [file:line] for confirmed nodes, [?] for uncertain ones.
 
-Example format:
-  caller_A()  [gemm.h:120]
-  └── caller_B()  [mma.h:44]
+Example (depth-3 / siblings-5):
+  top_caller()  [a.h:10]
+  └── mid_caller()  [b.h:44]
       └── %s()  [current]
-              ├── helper_X()  [utils.h:88]
-              └── helper_Y()  [utils.h:102]
-
-Mark uncertain nodes with [?].
-]]
-
--- ── Helpers ───────────────────────────────────────────────────────────────────
-
-local function fmt_jump_prompt(ctx)
-  return JUMP_PROMPT:format(
-    ctx.symbol,
-    ctx.filepath, ctx.row, ctx.col, ctx.filetype,
-    ctx.context_start, ctx.context_end,
-    ctx.filetype, ctx.context,
-    ctx.filetype
-  )
-end
-
-local function fmt_callstack_prompt(ctx)
-  return CALLSTACK_PROMPT:format(
+              ├── helper_A()  [c.h:8]
+              └── helper_B()  [c.h:20]
+                      └── leaf()  [d.h:3]
+]]):format(
     ctx.symbol,
     ctx.filepath, ctx.row, ctx.filetype,
     ctx.context_start, ctx.context_end,
     ctx.filetype, ctx.context,
-    ctx.symbol, ctx.symbol, ctx.symbol
+    cd, ctx.symbol, dd, ctx.symbol, ms, ms,
+    ctx.symbol
   )
 end
 
@@ -241,7 +239,7 @@ function M.call_stack()
     "",
   }
 
-  run_with_ui(fmt_callstack_prompt(ctx), header, function(state, _, _, _)
+  run_with_ui(fmt_callstack_prompt(ctx, _cfg.call_stack or {}), header, function(state, _, _, _)
     ui_m.append_block(state, { "", "  [q/Esc] Close" })
   end)
 end
